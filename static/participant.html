@@ -66,6 +66,7 @@
     <section id="received-section" class="card" hidden>
       <h2>我收到的匿名意见</h2>
       <pre id="received" class="manuscript-view"></pre>
+      <p id="received-hidden-note" class="pending" hidden>该意见已被主持人屏蔽，不再对你展示；你此前的确认与问答记录不受影响。</p>
 
       <div id="ack-box" class="clarify">
         <h3>确认已读</h3>
@@ -93,6 +94,19 @@
           <strong>我的问题：</strong><span id="question-text"></span>
           <p id="answer-view" class="muted"></p>
         </div>
+      </div>
+
+      <div id="report-box" class="clarify">
+        <h3>举报此意见</h3>
+        <p class="muted">如认为该意见不当，可向主持人举报（每条意见仅可举报一次，原因不超过 1000 字）。主持人将裁定保留或屏蔽；屏蔽后该意见不再对你展示，你的确认与问答记录不受影响。</p>
+        <div id="report-form">
+          <textarea id="report-input" rows="3" maxlength="1000" placeholder="举报原因（必填，不超过 1000 字）"></textarea>
+          <div class="row-actions">
+            <button id="submit-report" class="primary" type="button">提交举报</button>
+          </div>
+          <p id="report-msg"></p>
+        </div>
+        <p id="report-done" class="clarify-item" hidden></p>
       </div>
     </section>
   </div>

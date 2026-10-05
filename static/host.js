@@ -61,6 +61,8 @@ function render(s) {
 
   publishBtn.disabled = !s.can_publish;
 
+  renderReports(s.reports || []);
+
   const linksBody = document.getElementById("links");
   linksBody.innerHTML = "";
   for (const l of s.links) {
@@ -91,6 +93,76 @@ function render(s) {
     linksBody.appendChild(tr);
   }
 }
+
+// 本会话举报列表：只展示编号、原因、意见原文与处理状态；待处理的可裁定保留/屏蔽
+function renderReports(reports) {
+  const card = document.getElementById("reports-card");
+  const tbody = document.getElementById("reports");
+  tbody.innerHTML = "";
+  card.hidden = reports.length === 0;
+  const statusText = { pending: "待处理", kept: "已保留", hidden: "已屏蔽" };
+  for (const r of reports) {
+    const tr = document.createElement("tr");
+    const tdId = document.createElement("td");
+    tdId.textContent = "#" + r.id;
+    const tdReason = document.createElement("td");
+    tdReason.textContent = r.reason;
+    const tdContent = document.createElement("td");
+    tdContent.textContent = r.content;
+    const tdStatus = document.createElement("td");
+    tdStatus.textContent = statusText[r.status] || r.status;
+    tdStatus.className = r.status === "pending" ? "pending" : "ok";
+    const tdAction = document.createElement("td");
+    if (r.status === "pending") {
+      // 仅待处理可裁定；处理后不可更改
+      for (const [action, label] of [["keep", "保留"], ["hide", "屏蔽"]]) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = action === "hide" ? "link-danger report-action" : "link report-action";
+        btn.textContent = label;
+        btn.dataset.id = r.id;
+        btn.dataset.action = action;
+        tdAction.appendChild(btn);
+      }
+    }
+    tr.append(tdId, tdReason, tdContent, tdStatus, tdAction);
+    tbody.appendChild(tr);
+  }
+}
+
+// 主持人裁定一条待处理举报：保留或屏蔽，处理后不可更改
+document.getElementById("reports").addEventListener("click", async (e) => {
+  const btn = e.target.closest("button.report-action");
+  if (!btn) return;
+  const id = btn.dataset.id;
+  const action = btn.dataset.action;
+  const reportError = document.getElementById("report-error");
+  reportError.textContent = "";
+  if (
+    !confirm(
+      action === "hide"
+        ? `确定屏蔽举报 #${id} 对应的意见？\n屏蔽后该意见不再对作者展示（意见原文、问答与回执均保留），且处理后不可更改。`
+        : `确定保留举报 #${id} 对应的意见？\n保留后该意见继续对作者展示，且处理后不可更改。`
+    )
+  )
+    return;
+  btn.disabled = true;
+  try {
+    const r = await fetch("/api/h/" + token + "/reports/" + id, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action }),
+    });
+    const data = await r.json();
+    if (!r.ok) {
+      reportError.textContent =
+        "处理举报 #" + id + " 失败：" + (data.error || "请刷新主持台后重试");
+    }
+  } catch {
+    reportError.textContent = "网络错误，请重试";
+  }
+  refresh();
+});
 
 publishBtn.addEventListener("click", async () => {
   if (!confirm("确定公布？公布后稿件与意见均不可再修改。")) return;

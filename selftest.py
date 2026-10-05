@@ -158,6 +158,16 @@ def ack(client, token):
     return client.post(f"/api/p/{token}/ack")
 
 
+def report(client, token, reason):
+    return client.post(f"/api/p/{token}/report", json={"reason": reason})
+
+
+def resolve_report(client, host_token, report_id, action):
+    return client.post(
+        f"/api/h/{host_token}/reports/{report_id}", json={"action": action}
+    )
+
+
 def publish_with_reviews(client, host_token, tokens, reviews=("甲评乙", "乙评丙", "丙评甲")):
     """三人首轮意见全部提交并一次公布，返回各 token。"""
     for tok, content in zip(tokens, reviews):
@@ -816,6 +826,307 @@ class ReceiptTest(unittest.TestCase):
         )
         self.assertFalse(state(self.client, self.t_yi)["receipt"]["acknowledged"])
         self.assertEqual(self.host_reviewers()[0]["acknowledged_at"], first_at)
+
+
+class ReportTest(unittest.TestCase):
+    """公布后意见举报：404/409/400 规则、主持裁定、屏蔽效果、身份隔离、并发与持久化。"""
+
+    def setUp(self):
+        self.client = new_client()
+        self.host_token, self.tokens = create_session(self.client)
+        self.t_jia, self.t_yi, self.t_bing = self.tokens
+
+    def reports_count(self):
+        """当前会话（甲所在会话）的举报总数。"""
+        conn = sqlite3.connect(app_module.DB_PATH)
+        try:
+            return conn.execute(
+                "SELECT COUNT(*) FROM reports WHERE session_id="
+                " (SELECT session_id FROM participants WHERE token=?)",
+                (self.t_jia,),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+    def host_reports(self):
+        resp = self.client.get(f"/api/h/{self.host_token}")
+        assert resp.status_code == 200, resp.get_json()
+        return resp.get_json()["reports"]
+
+    def test_pre_publish_409_invalid_link_404_and_no_writes(self):
+        # 公布前举报 409；无效链接 404；均不写数据
+        self.assertEqual(report(self.client, self.t_jia, "公布前举报").status_code, 409)
+        self.assertEqual(report(new_client(), "无效链接", "x").status_code, 404)
+        self.assertEqual(self.reports_count(), 0)
+        # 公布前参与状态不含举报；主持台举报列表为空
+        s = state(self.client, self.t_jia)
+        self.assertIsNone(s["report"])
+        self.assertFalse(s["received_hidden"])
+        self.assertEqual(self.host_reports(), [])
+
+        # 公布前换发链接后：旧链接举报 404，新链接仍 409（尚未公布）
+        resp = self.client.post(
+            f"/api/h/{self.host_token}/rotate-link",
+            json={"name": "甲", "link": f"/p/{self.t_jia}"},
+        )
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        new_jia = resp.get_json()["url"].rsplit("/", 1)[-1]
+        self.assertEqual(report(self.client, self.t_jia, "旧链接举报").status_code, 404)
+        self.assertEqual(report(self.client, new_jia, "仍公布前").status_code, 409)
+        self.assertEqual(self.reports_count(), 0)
+
+    def test_text_limits_and_failed_attempts_change_nothing(self):
+        publish_with_reviews(self.client, self.host_token, self.tokens)
+        # 空白、超长、非字符串均 400；恰好 1000 字可提交
+        self.assertEqual(report(self.client, self.t_jia, "   ").status_code, 400)
+        self.assertEqual(report(self.client, self.t_jia, "x" * 1001).status_code, 400)
+        resp = self.client.post(f"/api/p/{self.t_jia}/report", json={"reason": 123})
+        self.assertEqual(resp.status_code, 400)
+        resp = self.client.post(f"/api/p/{self.t_jia}/report", json={})
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(self.reports_count(), 0)
+        # 被拒绝后正常长度仍可走通（失败不改变数据）
+        self.assertEqual(report(self.client, self.t_jia, "y" * 1000).status_code, 200)
+        self.assertEqual(self.reports_count(), 1)
+        # 原稿与原意见仍冻结不变
+        s = state(self.client, self.t_jia)
+        self.assertEqual(s["manuscript"], "文本一")
+        self.assertEqual(s["received"], "丙评甲")
+        self.assertEqual(s["version"], 1)
+
+    def test_full_flow_author_view_and_host_list(self):
+        publish_with_reviews(self.client, self.host_token, self.tokens)
+        # 未举报时：作者状态为未举报结构；主持列表为空
+        s = state(self.client, self.t_jia)
+        self.assertEqual(s["report"], {"reported": False, "reason": None, "status": None})
+        self.assertFalse(s["received_hidden"])
+        self.assertEqual(self.host_reports(), [])
+
+        # 举报成功；作者可见自己的举报状态（待处理），意见照常展示
+        self.assertEqual(report(self.client, self.t_jia, "该意见含人身攻击").status_code, 200)
+        s = state(self.client, self.t_jia)
+        self.assertEqual(
+            s["report"],
+            {"reported": True, "reason": "该意见含人身攻击", "status": "pending"},
+        )
+        self.assertEqual(s["received"], "丙评甲")
+        self.assertFalse(s["received_hidden"])
+
+        # 重复举报 409，原因与状态不变
+        self.assertEqual(report(self.client, self.t_jia, "再举报一次").status_code, 409)
+        self.assertEqual(state(self.client, self.t_jia)["report"]["reason"], "该意见含人身攻击")
+        self.assertEqual(self.reports_count(), 1)
+
+        # 主持列表：只含编号、原因、意见原文、处理状态，不附姓名/链接/问答
+        reports = self.host_reports()
+        self.assertEqual(len(reports), 1)
+        entry = reports[0]
+        self.assertEqual(set(entry.keys()), {"id", "reason", "content", "status"})
+        self.assertEqual(entry["reason"], "该意见含人身攻击")
+        self.assertEqual(entry["content"], "丙评甲")
+        self.assertEqual(entry["status"], "pending")
+        self.assertNotIn(self.t_jia, str(entry))
+        self.assertNotIn(self.t_bing, str(entry))
+
+    def test_isolation_between_participants(self):
+        publish_with_reviews(self.client, self.host_token, self.tokens)
+        ask(self.client, self.t_jia, "甲的问题正文XYZ")
+        report(self.client, self.t_jia, "举报原因私密ABC")
+
+        # 乙（无关第三方）：自己的举报状态为未举报，响应中不含甲的举报信息
+        s_yi = state(self.client, self.t_yi)
+        self.assertEqual(
+            s_yi["report"], {"reported": False, "reason": None, "status": None}
+        )
+        body = self.client.get(f"/api/p/{self.t_yi}").get_data(as_text=True)
+        self.assertNotIn("私密ABC", body)
+        # 丙（评审者）：同样拿不到作者的举报信息
+        body = self.client.get(f"/api/p/{self.t_bing}").get_data(as_text=True)
+        self.assertNotIn("私密ABC", body)
+        # 主持列表不含问答内容
+        host_body = self.client.get(f"/api/h/{self.host_token}").get_data(as_text=True)
+        self.assertNotIn("正文XYZ", host_body)
+
+    def test_keep_resolution_keeps_received_and_is_final(self):
+        publish_with_reviews(self.client, self.host_token, self.tokens)
+        report(self.client, self.t_jia, "待裁定")
+        rid = self.host_reports()[0]["id"]
+
+        # 保留：received 照常展示，举报状态变为已保留
+        self.assertEqual(
+            resolve_report(self.client, self.host_token, rid, "keep").status_code, 200
+        )
+        s = state(self.client, self.t_jia)
+        self.assertEqual(s["received"], "丙评甲")
+        self.assertFalse(s["received_hidden"])
+        self.assertEqual(s["report"]["status"], "kept")
+        self.assertEqual(self.host_reports()[0]["status"], "kept")
+
+        # 处理后不可改：再保留/再屏蔽均 409，状态不变
+        self.assertEqual(
+            resolve_report(self.client, self.host_token, rid, "keep").status_code, 409
+        )
+        self.assertEqual(
+            resolve_report(self.client, self.host_token, rid, "hide").status_code, 409
+        )
+        self.assertEqual(self.host_reports()[0]["status"], "kept")
+        self.assertEqual(state(self.client, self.t_jia)["received"], "丙评甲")
+
+    def test_hide_resolution_hides_received_only(self):
+        publish_with_reviews(self.client, self.host_token, self.tokens)
+        # 先建立问答与回执
+        ask(self.client, self.t_jia, "甲的澄清")
+        answer(self.client, self.t_bing, "丙的答复")
+        first_at = ack(self.client, self.t_jia).get_json()["acknowledged_at"]
+        report(self.client, self.t_jia, "意见不当")
+        rid = self.host_reports()[0]["id"]
+
+        # 屏蔽：作者 received 为 null 并标明已屏蔽
+        self.assertEqual(
+            resolve_report(self.client, self.host_token, rid, "hide").status_code, 200
+        )
+        s = state(self.client, self.t_jia)
+        self.assertIsNone(s["received"])
+        self.assertTrue(s["received_hidden"])
+        self.assertEqual(s["report"]["status"], "hidden")
+        # 问答与回执不变
+        self.assertEqual(
+            s["received_clarification"],
+            {"question": "甲的澄清", "answer": "丙的答复", "answered": True},
+        )
+        self.assertEqual(
+            s["receipt"], {"acknowledged": True, "acknowledged_at": first_at}
+        )
+
+        # 意见原文在库中不变；评审者自己的意见与问答视角不变
+        conn = sqlite3.connect(app_module.DB_PATH)
+        try:
+            row = conn.execute(
+                "SELECT content, valid FROM reviews WHERE session_id="
+                " (SELECT session_id FROM participants WHERE token=?) AND target_id="
+                " (SELECT id FROM participants WHERE token=?)",
+                (self.t_jia, self.t_jia),
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(row, ("丙评甲", 1))
+        s_bing = state(self.client, self.t_bing)
+        self.assertEqual(s_bing["my_review"]["content"], "丙评甲")
+        self.assertTrue(s_bing["my_review"]["valid"])
+        self.assertEqual(s_bing["my_review_clarification"]["answer"], "丙的答复")
+
+        # 屏蔽后：重复举报仍 409；回执仍可确认且首次时间不变；主持列表仍显示原文与状态
+        self.assertEqual(report(self.client, self.t_jia, "屏蔽后再举报").status_code, 409)
+        self.assertEqual(
+            ack(self.client, self.t_jia).get_json()["acknowledged_at"], first_at
+        )
+        entry = self.host_reports()[0]
+        self.assertEqual(entry["status"], "hidden")
+        self.assertEqual(entry["content"], "丙评甲")
+        # 处理后不可改
+        self.assertEqual(
+            resolve_report(self.client, self.host_token, rid, "keep").status_code, 409
+        )
+
+    def test_resolve_404_rules(self):
+        publish_with_reviews(self.client, self.host_token, self.tokens)
+        report(self.client, self.t_jia, "本会话举报")
+        rid = self.host_reports()[0]["id"]
+
+        # 无效主持链接 404
+        self.assertEqual(
+            resolve_report(self.client, "假主持", rid, "hide").status_code, 404
+        )
+        # 不存在的编号 404
+        self.assertEqual(
+            resolve_report(self.client, self.host_token, 987654, "hide").status_code, 404
+        )
+        # 跨会话编号 404：另一会话的举报不能用本会话主持链接处理
+        host2, tokens2 = create_session(new_client())
+        publish_with_reviews(new_client(), host2, tokens2)
+        c2 = new_client()
+        report(c2, tokens2[0], "另一会话的举报")
+        resp = c2.get(f"/api/h/{host2}")
+        rid2 = resp.get_json()["reports"][0]["id"]
+        self.assertEqual(
+            resolve_report(self.client, self.host_token, rid2, "hide").status_code, 404
+        )
+        # 非数字编号 404（路由不匹配）
+        self.assertEqual(
+            self.client.post(
+                f"/api/h/{self.host_token}/reports/abc", json={"action": "hide"}
+            ).status_code,
+            404,
+        )
+        # 非法动作 400；全部失败后举报仍待处理
+        self.assertEqual(
+            resolve_report(self.client, self.host_token, rid, "xxx").status_code, 400
+        )
+        self.assertEqual(self.host_reports()[0]["status"], "pending")
+        # 另一会话的举报也未受影响
+        resp = c2.get(f"/api/h/{host2}")
+        self.assertEqual(resp.get_json()["reports"][0]["status"], "pending")
+
+    def test_concurrent_report_only_one_wins(self):
+        publish_with_reviews(self.client, self.host_token, self.tokens)
+        results = []
+
+        def worker():
+            results.append(report(new_client(), self.t_jia, "并发举报").status_code)
+
+        threads = [threading.Thread(target=worker) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+            self.assertFalse(t.is_alive())
+        self.assertEqual(sorted(results), [200, 409, 409, 409, 409])
+        self.assertEqual(self.reports_count(), 1)
+
+    def test_concurrent_resolve_only_one_wins(self):
+        publish_with_reviews(self.client, self.host_token, self.tokens)
+        report(self.client, self.t_jia, "并发裁定")
+        rid = self.host_reports()[0]["id"]
+        results = []
+
+        def worker():
+            results.append(
+                resolve_report(new_client(), self.host_token, rid, "hide").status_code
+            )
+
+        threads = [threading.Thread(target=worker) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+            self.assertFalse(t.is_alive())
+        self.assertEqual(sorted(results), [200, 409, 409, 409, 409])
+        self.assertEqual(self.host_reports()[0]["status"], "hidden")
+        self.assertTrue(state(self.client, self.t_jia)["received_hidden"])
+
+    def test_report_state_same_snapshot_and_restart_persistence(self):
+        publish_with_reviews(self.client, self.host_token, self.tokens)
+        report(self.client, self.t_jia, "重启前举报")
+        rid = self.host_reports()[0]["id"]
+        resolve_report(self.client, self.host_token, rid, "hide")
+        # 举报状态与原状态字段同一快照返回
+        s = state(self.client, self.t_jia)
+        self.assertTrue(s["published"])
+        self.assertIsNone(s["received"])
+        self.assertTrue(s["received_hidden"])
+        self.assertEqual(s["report"]["status"], "hidden")
+        # 模拟重启：举报记录与裁定保留
+        app_module.init_db()
+        s = state(self.client, self.t_jia)
+        self.assertTrue(s["received_hidden"])
+        self.assertEqual(s["report"]["status"], "hidden")
+        entry = self.host_reports()[0]
+        self.assertEqual(entry["status"], "hidden")
+        self.assertEqual(entry["reason"], "重启前举报")
+        # 重启后仍不可重复处理
+        self.assertEqual(
+            resolve_report(self.client, self.host_token, rid, "keep").status_code, 409
+        )
 
 
 class RotateLinkTest(unittest.TestCase):
@@ -1856,6 +2167,69 @@ class OldSchemaMigrationTest(unittest.TestCase):
                 {"acknowledged": True, "acknowledged_at": first_at},
             )
             self.assertEqual(ack(client, "tk").get_json()["acknowledged_at"], first_at)
+        finally:
+            app_module.DB_PATH = original
+
+    def test_old_db_reports_auto_supported(self):
+        """旧库启动时自动补建举报表：可举报、可裁定，重启后记录与裁定保留。"""
+        tmp_dir = tempfile.mkdtemp(prefix="review-olddb-report-")
+        old_path = os.path.join(tmp_dir, "old.db")
+        conn = sqlite3.connect(old_path)
+        conn.executescript(self.OLD_SCHEMA)
+        conn.execute("INSERT INTO sessions (id, host_token, published) VALUES (1,'ht',1)")
+        conn.execute(
+            "INSERT INTO participants (id, session_id, token, name, position, manuscript, version)"
+            " VALUES (1,1,'tk','旧库作者',0,'旧稿',1)"
+        )
+        conn.execute(
+            "INSERT INTO reviews (id, session_id, reviewer_id, target_id, target_version, content, valid)"
+            " VALUES (1,1,1,1,1,'旧意见',1)"
+        )
+        conn.commit()
+        conn.close()
+
+        original = app_module.DB_PATH
+        app_module.DB_PATH = old_path
+        try:
+            app_module.init_db()
+            c = sqlite3.connect(old_path)
+            try:
+                tables = {
+                    r[0]
+                    for r in c.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall()
+                }
+            finally:
+                c.close()
+            self.assertIn("reports", tables)
+
+            client = new_client()
+            # 旧库上可直接举报：作者状态出现自己的举报，主持列表可见
+            self.assertEqual(report(client, "tk", "旧库举报").status_code, 200)
+            data = client.get("/api/p/tk").get_json()
+            self.assertEqual(
+                data["report"],
+                {"reported": True, "reason": "旧库举报", "status": "pending"},
+            )
+            reports = client.get("/api/h/ht").get_json()["reports"]
+            self.assertEqual(len(reports), 1)
+            self.assertEqual(reports[0]["content"], "旧意见")
+            rid = reports[0]["id"]
+            # 裁定屏蔽：received 为 null 并标明已屏蔽，意见原文不变
+            self.assertEqual(resolve_report(client, "ht", rid, "hide").status_code, 200)
+            data = client.get("/api/p/tk").get_json()
+            self.assertIsNone(data["received"])
+            self.assertTrue(data["received_hidden"])
+            # 模拟重启：举报记录与裁定保留，仍不可重复处理
+            app_module.init_db()
+            data = client.get("/api/p/tk").get_json()
+            self.assertTrue(data["received_hidden"])
+            self.assertEqual(data["report"]["status"], "hidden")
+            self.assertEqual(
+                client.get("/api/h/ht").get_json()["reports"][0]["status"], "hidden"
+            )
+            self.assertEqual(resolve_report(client, "ht", rid, "keep").status_code, 409)
         finally:
             app_module.DB_PATH = original
 

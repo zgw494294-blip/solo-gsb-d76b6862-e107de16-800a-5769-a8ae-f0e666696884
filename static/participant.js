@@ -20,6 +20,7 @@ const els = {
   publishedBanner: document.getElementById("published-banner"),
   receivedSection: document.getElementById("received-section"),
   received: document.getElementById("received"),
+  receivedHiddenNote: document.getElementById("received-hidden-note"),
   ackBox: document.getElementById("ack-box"),
   ackForm: document.getElementById("ack-form"),
   ackButton: document.getElementById("ack-button"),
@@ -42,6 +43,12 @@ const els = {
   answerMsg: document.getElementById("answer-msg"),
   answerDone: document.getElementById("answer-done"),
   answerText: document.getElementById("answer-text"),
+  reportBox: document.getElementById("report-box"),
+  reportForm: document.getElementById("report-form"),
+  reportInput: document.getElementById("report-input"),
+  submitReport: document.getElementById("submit-report"),
+  reportMsg: document.getElementById("report-msg"),
+  reportDone: document.getElementById("report-done"),
 };
 
 let firstLoad = true;
@@ -133,6 +140,9 @@ function render(s) {
     els.review.disabled = true;
     els.submitReview.disabled = true;
     els.receivedSection.hidden = false;
+    // 屏蔽后 received 为 null 且 received_hidden 为 true：页面据此提示，不再展示原文
+    els.receivedHiddenNote.hidden = !s.received_hidden;
+    els.received.hidden = !!s.received_hidden;
     els.received.textContent = s.received !== null ? s.received : "（无）";
   } else {
     // 分配改变、未确认重读前禁用提交（意见文本框保留可编辑）；公布前其余状态可提交
@@ -142,6 +152,7 @@ function render(s) {
   renderReceipt(s.published ? s.receipt : null);
   renderQuestion(s.published ? s.received_clarification : null);
   renderAnswer(s.published ? s.my_review_clarification : null);
+  renderReport(s.published ? s.report : null);
 
   firstLoad = false;
 }
@@ -214,6 +225,26 @@ function renderAnswer(c) {
     els.answerForm.hidden = false;
     els.answerDone.hidden = true;
   }
+}
+
+// 作者视角：对自己收到意见的举报。举报状态以服务端快照为准；每条意见仅可举报一次
+function renderReport(r) {
+  if (!r) {
+    els.reportBox.hidden = true;
+    return;
+  }
+  els.reportBox.hidden = false;
+  if (!r.reported) {
+    // 尚未举报：保持输入框可编辑；轮询不触碰输入框，避免覆盖正在输入的原因
+    els.reportForm.hidden = false;
+    els.reportDone.hidden = true;
+    return;
+  }
+  // 已举报：锁定为只读状态展示（待处理/已保留/已屏蔽），输入框整体隐藏
+  els.reportForm.hidden = true;
+  els.reportDone.hidden = false;
+  const statusText = { pending: "待处理", kept: "已保留", hidden: "已屏蔽" }[r.status] || r.status;
+  els.reportDone.textContent = "已举报（" + statusText + "）。原因：" + r.reason;
 }
 
 els.saveMs.addEventListener("click", async () => {
@@ -309,6 +340,19 @@ els.submitAnswer.addEventListener("click", async () => {
   );
   refresh(); // 成功后用快照锁定为只读；失败也刷新以发现其他标签页的并发提交
   if (ok) els.answerInput.value = "";
+});
+
+// 作者举报自己收到的匿名意见：每条意见仅可举报一次，以服务端快照呈现处理状态
+els.submitReport.addEventListener("click", async () => {
+  const ok = await submitOnce(
+    els.submitReport,
+    "/report",
+    { reason: els.reportInput.value },
+    els.reportMsg,
+    "举报已提交，等待主持人处理。"
+  );
+  refresh(); // 成功后用快照锁定为只读；失败也刷新以发现并发举报或最新裁定
+  if (ok) els.reportInput.value = "";
 });
 
 // 作者明确确认已读收到的意见：只有点击才确认，以服务端成功响应更新确认状态
