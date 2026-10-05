@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>稿件匿名互评 · 主持</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<main>
+  <h1>主持台</h1>
+  <p id="fatal" class="error" hidden></p>
+
+  <div id="content">
+    <p id="published-banner" class="banner" hidden>已公布：参与者现在可以看到自己收到的匿名意见，稿件与意见均已锁定。</p>
+
+    <section class="card">
+      <h2>互评进度</h2>
+      <p id="pending-summary" class="muted"></p>
+      <table>
+        <thead><tr><th>姓名</th><th>互评意见状态</th><th id="ack-head" hidden>已读回执</th></tr></thead>
+        <tbody id="reviewers"></tbody>
+      </table>
+      <p class="muted" id="ack-note" hidden>已读回执按留存名单原顺序显示：作者在其页面明确确认已读后记为"已确认"并给出首次确认时间；此处不展示意见或问答内容。</p>
+      <div class="row-actions">
+        <button id="publish" class="primary" disabled>全部公布</button>
+      </div>
+      <p class="muted">只有每篇当前稿件都有有效意见时才能公布；公布为一次性操作，公布后稿件与意见均不可再改。</p>
+      <p id="error" class="error"></p>
+    </section>
+
+    <section class="card">
+      <h2>个人链接（分发给对应的人）</h2>
+      <table>
+        <thead><tr><th>姓名</th><th>个人链接</th><th>操作</th></tr></thead>
+        <tbody id="links"></tbody>
+      </table>
+      <p class="muted">个人链接泄露时，可在公布前后为该成员换发链接：换发后原链接立即作废（再使用一律无效），新链接沿用其稿件、版本、意见与问答；其他人的链接不受影响。</p>
+      <p class="muted">公布前还可以移除退出互评的成员：留存成员按原录入顺序重新闭合互评环，移除后至少保留 3 人；不能补人，也不能恢复。退出者的个人链接永久失效，其发出或收到的意见不计入公布条件；只有原来评退出者的人会改评下一位留存成员（旧意见失效，需重新阅读提交），其他人的稿件、版本、意见与链接全部保留。</p>
+      <p id="remove-error" class="error"></p>
+      <p id="rotate-error" class="error"></p>
+    </section>
+  </div>
+</main>
+<script src="/static/host.js"></script>
+</body>
+</html>
