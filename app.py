@@ -14,6 +14,10 @@
   按留存名单原顺序显示各成员已确认/待确认与首次确认时间（不含意见或问答内容），
   其他参与者不得获得别人的回执。确认不改变稿件、意见及问答，也不影响提问或答复
   权限；换发链接后回执随原身份保留。
+- 公布后作者可举报自己收到的意见，每条意见一次，原因非空且不超过 1000 字。主持台
+  只显示举报编号、原因、意见原文和处理状态，不显示作者姓名、个人链接或问答；主持人
+  可将待处理举报裁定为保留或屏蔽，裁定不可修改。屏蔽后作者状态的 received 为 null，
+  但意见原文、问答、回执及评审者自己的意见均保持不变。
 - 个人链接泄露时，主持人可凭主持链接在主持台为指定成员换发链接（公布前后均可）：
   生成新随机链接更新主持台，旧链接立即作废——其之后发起的状态读取与一切写入均 404；
   新链接沿用同一参与者的稿件、版本、分配、意见与问答，不重建身份、不使意见失效。
@@ -46,6 +50,7 @@ MIN_PEOPLE = 3
 MAX_PEOPLE = 8
 MAX_NAME_LEN = 50
 MAX_TEXT_LEN = 100000
+MAX_REPORT_REASON_LEN = 1000
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -94,6 +99,17 @@ CREATE TABLE IF NOT EXISTS receipts (
     review_id INTEGER NOT NULL UNIQUE REFERENCES reviews(id),
     acknowledged_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+-- 公布后的意见举报：每条收到的有效意见至多一条举报；主持人裁定为保留/屏蔽。
+-- 屏蔽只改变作者是否仍能读到意见原文，意见、问答与回执本身均不删除、不修改。
+CREATE TABLE IF NOT EXISTS reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES sessions(id),
+    review_id INTEGER NOT NULL UNIQUE REFERENCES reviews(id),
+    reason TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'kept', 'blocked')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    decided_at TEXT
+);
 -- 换发链接时登记的历史（已作废）个人链接：仅用于换发时区分"所见链接已过期"(409)，
 -- 作废链接在参与端的一切读取与写入均按不存在处理（404）
 CREATE TABLE IF NOT EXISTS token_history (
@@ -109,11 +125,12 @@ app = Flask(__name__)
 def init_db():
     """建库建表（幂等），数据落盘在 DB_PATH，重启后保留。
 
-    旧版数据库（无 clarifications / token_history / receipts 表，或 participants 缺
-    active / assignment_nonce / assignment_gen 列）启动时自动补建问答表、历史链接表、
-    回执表与移除成员所需列，既有 sessions/participants/reviews 数据原样保留；
+    旧版数据库（无 clarifications / token_history / receipts / reports 表，或
+    participants 缺 active / assignment_nonce / assignment_gen 列）启动时自动补建
+    问答表、历史链接表、回执表、举报表与移除成员所需列，既有
+    sessions/participants/reviews 数据原样保留；
     补列时为每位既有成员回填一个分配凭据（视为其当前分配从未变过，gen=0），
-    旧库因此自动支持移除成员与已读回执（既有意见初始为待确认），无需手动迁移。
+    旧库因此自动支持移除成员、已读回执与意见举报（既有意见初始为未举报），无需手动迁移。
     """
     os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
@@ -322,6 +339,39 @@ def receipt_view(row):
     return {"acknowledged": True, "acknowledged_at": row["acknowledged_at"]}
 
 
+def find_report_by_review(conn, review_id):
+    return conn.execute(
+        "SELECT * FROM reports WHERE review_id=?", (review_id,)
+    ).fetchone()
+
+
+def find_host_report(conn, session_id, report_id):
+    return conn.execute(
+        "SELECT * FROM reports WHERE id=? AND session_id=?",
+        (report_id, session_id),
+    ).fetchone()
+
+
+def report_status_view(row):
+    """作者查看自己举报时的状态；无举报时为 None。"""
+    if row is None:
+        return None
+    return {"id": row["id"], "reason": row["reason"], "status": row["status"]}
+
+
+def host_report_view(row):
+    """主持台举报列表：只含编号、原因、意见原文和处理状态。
+
+    刻意不含作者/评审者姓名、个人链接、问答或回执，避免主持页借举报获得匿名信息。
+    """
+    return {
+        "id": row["id"],
+        "reason": row["reason"],
+        "review": row["review_content"],
+        "status": row["status"],
+    }
+
+
 # ---------------- 页面 ----------------
 
 @app.get("/")
@@ -428,12 +478,19 @@ def host_status(host_token):
                     "acknowledged_at": view["acknowledged_at"],
                 }
             )
+        report_rows = conn.execute(
+            "SELECT rp.id, rp.reason, rp.status, r.content AS review_content"
+            " FROM reports rp JOIN reviews r ON rp.review_id=r.id"
+            " WHERE rp.session_id=? ORDER BY rp.id",
+            (session["id"],),
+        ).fetchall()
         conn.commit()
         return jsonify(
             {
                 "published": bool(session["published"]),
                 "can_publish": can_publish,
                 "reviewers": reviewers,
+                "reports": [host_report_view(r) for r in report_rows],
                 "links": [
                     {"name": p["name"], "url": f"/p/{p['token']}"} for p in parts
                 ],
@@ -635,7 +692,7 @@ def remove_participant(host_token):
 
 @app.get("/api/p/<token>")
 def participant_state(token):
-    """参与页数据：同一快照读取；不含他人姓名与任何私密链接；公布前不含收到的意见与问答。"""
+    """参与页数据：同一快照读取；不含他人姓名与任何私密链接；公布前不含意见、问答与举报。"""
     conn = get_db()
     try:
         # 只读事务：本人稿件、分配稿件、版本、意见与公布状态取自同一快照；
@@ -671,6 +728,10 @@ def participant_state(token):
             # 一问一答：公布前一律 None；公布后只返回与本人相关的那条意见的问答
             "received_clarification": None,
             "my_review_clarification": None,
+            # 作者对自己收到意见的举报状态；未举报为 None。其他参与者不会得到该对象
+            "report": None,
+            # 收到的意见被主持人屏蔽后，received 置空并以此明确标明"已屏蔽"
+            "received_blocked": False,
         }
         if my_review is not None:
             resp["my_review"] = {
@@ -689,10 +750,18 @@ def participant_state(token):
             # 匿名：只返回意见内容，不返回评审人任何信息；评审者须仍留存
             row = find_received_review(conn, me)
             if row is not None:
-                resp["received"] = row["content"]
-                # 作者自己的已读回执，与稿件、意见、问答同一快照读取
+                report = find_report_by_review(conn, row["id"])
+                resp["report"] = report_status_view(report)
+                # 回执不随屏蔽改变，仍在同一快照返回
                 resp["receipt"] = receipt_view(find_receipt(conn, row["id"]))
-                # 作者视角：就我收到的这条意见的一问一答（仅本人与对应评审者可见）
+                # 主持人屏蔽举报后：作者不再取得意见原文，但问答、回执仍绑定原意见且不变
+                if report is not None and report["status"] == "blocked":
+                    resp["received"] = None
+                    resp["received_blocked"] = True
+                else:
+                    resp["received"] = row["content"]
+                # 作者视角：就我收到的这条意见的一问一答（仅本人与对应评审者可见）；
+                # 屏蔽只隐藏意见原文，不删除、不改变问答
                 resp["received_clarification"] = clarification_view(
                     find_clarification(conn, row["id"])
                 )
@@ -942,6 +1011,94 @@ def acknowledge_receipt(token):
         # 重复确认仍成功：不回写，首次确认时间保持不变
         conn.commit()
         return jsonify({"ok": True, "acknowledged_at": receipt["acknowledged_at"]})
+    except Exception:
+        conn.rollback()
+        raise
+
+
+# ---------------- 公布后的意见举报 ----------------
+
+
+@app.post("/api/p/<token>/report")
+def report_received_review(token):
+    """作者举报自己收到的意见：公布后开放，每条意见至多举报一次。"""
+    data = request.get_json(silent=True) or {}
+    reason = data.get("reason")
+    if (
+        not isinstance(reason, str)
+        or not reason.strip()
+        or len(reason) > MAX_REPORT_REASON_LEN
+    ):
+        return err(f"举报原因不能为空且不超过 {MAX_REPORT_REASON_LEN} 字")
+
+    conn = get_db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        me = find_participant(conn, token)
+        if me is None:
+            conn.rollback()
+            return err("个人链接无效", 404)
+        session = conn.execute(
+            "SELECT * FROM sessions WHERE id=?", (me["session_id"],)
+        ).fetchone()
+        # 公布前举报一律 409，且不改变任何数据
+        if not session["published"]:
+            conn.rollback()
+            return err("尚未公布，不能举报", 409)
+        review = find_received_review(conn, me)
+        if review is None:
+            conn.rollback()
+            return err("没有可举报的意见", 409)
+        existing = find_report_by_review(conn, review["id"])
+        if existing is not None:
+            conn.rollback()
+            return err("该意见已经举报，不能重复举报", 409)
+        cur = conn.execute(
+            "INSERT INTO reports (session_id, review_id, reason) VALUES (?,?,?)",
+            (session["id"], review["id"], reason),
+        )
+        report_id = cur.lastrowid
+        conn.commit()
+        return jsonify({"ok": True, "id": report_id, "status": "pending"})
+    except Exception:
+        conn.rollback()
+        raise
+
+
+# ---------------- 主持人处理意见举报 ----------------
+
+
+@app.post("/api/h/<host_token>/reports/<int:report_id>/<any(keep, block):decision>")
+@app.post("/api/h/<host_token>/report/<int:report_id>/<any(keep, block):decision>")
+def decide_report(host_token, report_id, decision):
+    """主持人对本会话待处理举报选择保留或屏蔽，裁定一次且不可修改。"""
+    new_status = "kept" if decision == "keep" else "blocked"
+    conn = get_db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        session = find_session_by_host(conn, host_token)
+        if session is None:
+            conn.rollback()
+            return err("主持链接无效", 404)
+        report = find_host_report(conn, session["id"], report_id)
+        # 编号不存在或属于其他会话均按不存在处理，不借错误透露其他会话信息
+        if report is None:
+            conn.rollback()
+            return err("举报不存在", 404)
+        if report["status"] != "pending":
+            conn.rollback()
+            return err("该举报已经处理，不能重复处理或修改", 409)
+        cur = conn.execute(
+            "UPDATE reports SET status=?, decided_at=datetime('now')"
+            " WHERE id=? AND status='pending'",
+            (new_status, report_id),
+        )
+        # BEGIN IMMEDIATE 已串行化；条件更新再兜底，确保同一举报的并发裁定最多一次成功
+        if cur.rowcount != 1:
+            conn.rollback()
+            return err("该举报已经处理，不能重复处理或修改", 409)
+        conn.commit()
+        return jsonify({"ok": True, "id": report_id, "status": new_status})
     except Exception:
         conn.rollback()
         raise

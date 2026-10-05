@@ -59,6 +59,8 @@ function render(s) {
     tbody.appendChild(tr);
   }
 
+  renderReports(s.published ? (s.reports || []) : []);
+
   publishBtn.disabled = !s.can_publish;
 
   const linksBody = document.getElementById("links");
@@ -89,6 +91,57 @@ function render(s) {
     tdAction.append(rotateBtn, removeBtn);
     tr.append(tdName, tdLink, tdAction);
     linksBody.appendChild(tr);
+  }
+}
+
+function renderReports(reports) {
+  document.getElementById("reports-section").hidden = !reports.length;
+  const statusText = {
+    pending: "待处理",
+    kept: "已保留",
+    blocked: "已屏蔽",
+  };
+  const tbody = document.getElementById("reports");
+  tbody.innerHTML = "";
+  for (const r of reports) {
+    const tr = document.createElement("tr");
+
+    const tdId = document.createElement("td");
+    tdId.textContent = "#" + r.id;
+
+    const tdReason = document.createElement("td");
+    tdReason.textContent = r.reason;
+
+    const tdReview = document.createElement("td");
+    tdReview.textContent = r.review;
+
+    const tdStatus = document.createElement("td");
+    tdStatus.textContent = statusText[r.status] || r.status;
+    tdStatus.className = r.status === "pending" ? "pending" : "ok";
+
+    const tdAction = document.createElement("td");
+    if (r.status === "pending") {
+      const keepBtn = document.createElement("button");
+      keepBtn.type = "button";
+      keepBtn.className = "link";
+      keepBtn.textContent = "保留";
+      keepBtn.dataset.id = r.id;
+      keepBtn.dataset.decision = "keep";
+
+      const blockBtn = document.createElement("button");
+      blockBtn.type = "button";
+      blockBtn.className = "link-danger";
+      blockBtn.textContent = "屏蔽";
+      blockBtn.dataset.id = r.id;
+      blockBtn.dataset.decision = "block";
+
+      tdAction.append(keepBtn, blockBtn);
+    } else {
+      tdAction.textContent = "—";
+    }
+
+    tr.append(tdId, tdReason, tdReview, tdStatus, tdAction);
+    tbody.appendChild(tr);
   }
 }
 
@@ -179,6 +232,33 @@ document.getElementById("links").addEventListener("click", async (e) => {
     }
   } catch {
     removeError.textContent = "网络错误，请重试";
+  }
+  refresh();
+});
+
+// 主持人处理举报：裁定只提交一次；成功后轮询刷新，重复处理由服务端返回 409
+document.getElementById("reports").addEventListener("click", async (e) => {
+  const btn = e.target.closest("button[data-decision]");
+  if (!btn) return;
+  const id = btn.dataset.id;
+  const decision = btn.dataset.decision;
+  const actionText = decision === "keep" ? "保留" : "屏蔽";
+  const errorEl = document.getElementById("report-decision-error");
+  errorEl.textContent = "";
+  if (!confirm(`确定对举报 #${id} 选择「${actionText}」？处理后不可修改。`)) return;
+  btn.disabled = true;
+  try {
+    const r = await fetch(`/api/h/${token}/reports/${id}/${decision}`, { method: "POST" });
+    const data = await r.json();
+    if (!r.ok) {
+      errorEl.textContent = `举报 #${id} 处理失败：` + (data.error || "请刷新主持台后重试");
+      btn.disabled = false;
+      return;
+    }
+  } catch {
+    errorEl.textContent = "网络错误，请重试";
+    btn.disabled = false;
+    return;
   }
   refresh();
 });

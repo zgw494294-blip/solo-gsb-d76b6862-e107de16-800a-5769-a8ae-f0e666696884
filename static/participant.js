@@ -42,6 +42,15 @@ const els = {
   answerMsg: document.getElementById("answer-msg"),
   answerDone: document.getElementById("answer-done"),
   answerText: document.getElementById("answer-text"),
+  receivedBlockedNotice: document.getElementById("received-blocked-notice"),
+  reportForm: document.getElementById("report-form"),
+  reportInput: document.getElementById("report-input"),
+  submitReport: document.getElementById("submit-report"),
+  reportMsg: document.getElementById("report-msg"),
+  reportDone: document.getElementById("report-done"),
+  reportId: document.getElementById("report-id"),
+  reportReason: document.getElementById("report-reason"),
+  reportStatus: document.getElementById("report-status"),
 };
 
 let firstLoad = true;
@@ -133,13 +142,16 @@ function render(s) {
     els.review.disabled = true;
     els.submitReview.disabled = true;
     els.receivedSection.hidden = false;
-    els.received.textContent = s.received !== null ? s.received : "（无）";
+    els.received.hidden = !!s.received_blocked;
+    els.receivedBlockedNotice.hidden = !s.received_blocked;
+    els.received.textContent = s.received_blocked ? "" : (s.received !== null ? s.received : "（无）");
   } else {
     // 分配改变、未确认重读前禁用提交（意见文本框保留可编辑）；公布前其余状态可提交
     els.submitReview.disabled = gated;
   }
 
   renderReceipt(s.published ? s.receipt : null);
+  renderReport(s.published ? s.report : null);
   renderQuestion(s.published ? s.received_clarification : null);
   renderAnswer(s.published ? s.my_review_clarification : null);
 
@@ -172,6 +184,26 @@ els.confirmReread.addEventListener("click", () => {
   if (latest && !latest.published) els.submitReview.disabled = false;
   setMsg(els.reviewMsg, "已绑定新分配，请在阅读新稿件后提交意见。");
 });
+
+// 作者视角：自己对收到意见的举报状态
+function renderReport(r) {
+  if (!r) {
+    els.reportForm.hidden = false;
+    els.reportDone.hidden = true;
+    els.submitReport.disabled = false;
+    return;
+  }
+  els.reportForm.hidden = true;
+  els.reportDone.hidden = false;
+  els.reportId.textContent = "#" + r.id;
+  els.reportReason.textContent = r.reason;
+  const text = {
+    pending: "待处理",
+    kept: "主持人已裁定保留",
+    blocked: "主持人已屏蔽该意见",
+  }[r.status] || r.status;
+  els.reportStatus.textContent = text;
+}
 
 // 作者视角：对收到的匿名意见的一问一答
 function renderQuestion(c) {
@@ -309,6 +341,18 @@ els.submitAnswer.addEventListener("click", async () => {
   );
   refresh(); // 成功后用快照锁定为只读；失败也刷新以发现其他标签页的并发提交
   if (ok) els.answerInput.value = "";
+});
+
+els.submitReport.addEventListener("click", async () => {
+  const ok = await submitOnce(
+    els.submitReport,
+    "/report",
+    { reason: els.reportInput.value },
+    els.reportMsg,
+    "举报已提交，等待主持人处理。"
+  );
+  refresh();
+  if (ok) els.reportInput.value = "";
 });
 
 // 作者明确确认已读收到的意见：只有点击才确认，以服务端成功响应更新确认状态

@@ -158,6 +158,18 @@ def ack(client, token):
     return client.post(f"/api/p/{token}/ack")
 
 
+def report_review(client, token, reason):
+    return client.post(
+        f"/api/p/{token}/report", json={"reason": reason}
+    )
+
+
+def decide_report(client, host_token, report_id, decision):
+    return client.post(
+        f"/api/h/{host_token}/reports/{report_id}/{decision}"
+    )
+
+
 def publish_with_reviews(client, host_token, tokens, reviews=("甲评乙", "乙评丙", "丙评甲")):
     """三人首轮意见全部提交并一次公布，返回各 token。"""
     for tok, content in zip(tokens, reviews):
@@ -1640,8 +1652,212 @@ class RemoveMemberTest(unittest.TestCase):
         )
 
 
+class ReportTest(unittest.TestCase):
+    """公布后的意见举报：作者提交、主持台裁定、屏蔽可见性与并发。"""
+
+    def setUp(self):
+        self.client = new_client()
+        self.host_token, self.tokens = create_session(self.client)
+        publish_with_reviews(self.client, self.host_token, self.tokens)
+
+    def host_status(self):
+        resp = self.client.get(f"/api/h/{self.host_token}")
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        return resp.get_json()
+
+    def test_report_validation_identity_and_visibility(self):
+        # 公布前另设新会话：举报返回 409，且不生成记录
+        pre_client = new_client()
+        host2, tokens2 = create_session(pre_client)
+        self.assertEqual(report_review(pre_client, tokens2[0], "原因").status_code, 409)
+        self.assertEqual(pre_client.get(f"/api/h/{host2}").get_json()["reports"], [])
+
+        # 原因不能为空、不能全空白，长度不能超过 1000 字
+        self.assertEqual(report_review(self.client, self.tokens[0], "").status_code, 400)
+        self.assertEqual(report_review(self.client, self.tokens[0], "   ").status_code, 400)
+        self.assertEqual(
+            report_review(self.client, self.tokens[0], "x" * 1001).status_code, 400
+        )
+        # 失败不留举报记录
+        self.assertIsNone(state(self.client, self.tokens[0])["report"])
+
+        resp = report_review(self.client, self.tokens[0], "甲的举报原因")
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        report_id = resp.get_json()["id"]
+        self.assertEqual(resp.get_json()["status"], "pending")
+
+        # 作者可查看自己的举报状态；每条意见只可举报一次
+        self.assertEqual(
+            state(self.client, self.tokens[0])["report"],
+            {"id": report_id, "reason": "甲的举报原因", "status": "pending"},
+        )
+        self.assertEqual(
+            report_review(self.client, self.tokens[0], "再次举报").status_code, 409
+        )
+        self.assertEqual(
+            self.client.post("/api/p/not-a-token/report", json={"reason": "x"}).status_code,
+            404,
+        )
+
+        # 主持列表只展示编号、原因、意见原文和处理状态；不含姓名、链接、问答字段
+        reports = self.host_status()["reports"]
+        self.assertEqual(len(reports), 1)
+        self.assertEqual(set(reports[0]), {"id", "reason", "review", "status"})
+        self.assertEqual(
+            reports[0],
+            {
+                "id": report_id,
+                "reason": "甲的举报原因",
+                "review": "丙评甲",
+                "status": "pending",
+            },
+        )
+        # 其他参与者（这里是对应评审者）状态里没有作者的举报信息，自己的意见原文不变
+        reviewer_state = state(self.client, self.tokens[2])
+        self.assertIsNone(reviewer_state["report"])
+        self.assertEqual(reviewer_state["my_review"]["content"], "丙评甲")
+
+    def test_keep_and_block_decisions_and_immutability(self):
+        # 甲的举报裁定保留：意见仍可读，状态变为 kept
+        r0 = report_review(self.client, self.tokens[0], "请求保留测试")
+        self.assertEqual(r0.status_code, 200, r0.get_json())
+        id0 = r0.get_json()["id"]
+        resp = decide_report(self.client, self.host_token, id0, "keep")
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        self.assertEqual(resp.get_json()["status"], "kept")
+        self.assertEqual(state(self.client, self.tokens[0])["received"], "丙评甲")
+        self.assertEqual(
+            state(self.client, self.tokens[0])["report"]["status"], "kept"
+        )
+
+        # 乙在被屏蔽前已有问答和回执
+        ask(self.client, self.tokens[1], "乙的问题")
+        answer(self.client, self.tokens[0], "甲的答复")
+        ack(self.client, self.tokens[1])
+
+        r1 = report_review(self.client, self.tokens[1], "请求屏蔽测试")
+        self.assertEqual(r1.status_code, 200, r1.get_json())
+        id1 = r1.get_json()["id"]
+        resp = decide_report(self.client, self.host_token, id1, "block")
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        self.assertEqual(resp.get_json()["status"], "blocked")
+
+        author_state = state(self.client, self.tokens[1])
+        self.assertIsNone(author_state["received"])
+        self.assertTrue(author_state["received_blocked"])
+        self.assertEqual(author_state["report"]["status"], "blocked")
+        # 问答与回执不变
+        self.assertEqual(
+            author_state["received_clarification"],
+            {"question": "乙的问题", "answer": "甲的答复", "answered": True},
+        )
+        self.assertTrue(author_state["receipt"]["acknowledged"])
+
+        # 评审者自己的意见及其问答不变
+        reviewer_state = state(self.client, self.tokens[0])
+        self.assertEqual(reviewer_state["my_review"]["content"], "甲评乙")
+        self.assertEqual(
+            reviewer_state["my_review_clarification"]["question"], "乙的问题"
+        )
+
+        # 丙的意见被屏蔽后，仍可对原意见发起一问一答；评审者乙也仍可答复
+        r2 = report_review(self.client, self.tokens[2], "丙请求屏蔽测试")
+        self.assertEqual(r2.status_code, 200, r2.get_json())
+        id2 = r2.get_json()["id"]
+        self.assertEqual(
+            decide_report(self.client, self.host_token, id2, "block").status_code, 200
+        )
+        self.assertEqual(ask(self.client, self.tokens[2], "丙屏蔽后的问题").status_code, 200)
+        self.assertEqual(answer(self.client, self.tokens[1], "乙屏蔽后的答复").status_code, 200)
+        blocked_qa = state(self.client, self.tokens[2])
+        self.assertIsNone(blocked_qa["received"])
+        self.assertTrue(blocked_qa["received_blocked"])
+        self.assertEqual(
+            blocked_qa["received_clarification"],
+            {"question": "丙屏蔽后的问题", "answer": "乙屏蔽后的答复", "answered": True},
+        )
+
+        # 主持列表仍保留意见原文，且只含允许字段
+        reports = {r["id"]: r for r in self.host_status()["reports"]}
+        self.assertEqual(reports[id1]["review"], "甲评乙")
+        self.assertEqual(reports[id1]["status"], "blocked")
+
+        # 处理后不可改：重复保留/屏蔽均 409；作者也不能重复举报
+        self.assertEqual(
+            decide_report(self.client, self.host_token, id1, "keep").status_code, 409
+        )
+        self.assertEqual(
+            decide_report(self.client, self.host_token, id1, "block").status_code, 409
+        )
+        self.assertEqual(
+            report_review(self.client, self.tokens[1], "再举报").status_code, 409
+        )
+        self.assertEqual(state(self.client, self.tokens[1])["received"], None)
+
+        # 无效主持链接 404；有效主持链接处理跨会话/不存在编号也 404
+        self.assertEqual(decide_report(self.client, "bad-host", id1, "keep").status_code, 404)
+        self.assertEqual(
+            decide_report(self.client, self.host_token, 999999, "keep").status_code, 404
+        )
+        other = new_client()
+        other_host, other_tokens = create_session(other)
+        publish_with_reviews(other, other_host, other_tokens)
+        other_id = report_review(other, other_tokens[0], "其他会话举报").get_json()["id"]
+        self.assertEqual(
+            decide_report(self.client, self.host_token, other_id, "keep").status_code,
+            404,
+        )
+        # 跨会话探测未改变原举报
+        self.assertEqual(
+            other.get(f"/api/h/{other_host}").get_json()["reports"][0]["status"],
+            "pending",
+        )
+
+    def test_concurrent_decision_succeeds_at_most_once(self):
+        resp = report_review(self.client, self.tokens[2], "并发处理测试")
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        report_id = resp.get_json()["id"]
+
+        start = threading.Barrier(2)
+        results = {}
+
+        def choose(decision):
+            client = new_client()
+            start.wait()
+            results[decision] = decide_report(
+                client, self.host_token, report_id, decision
+            ).status_code
+
+        t1 = threading.Thread(target=choose, args=("keep",))
+        t2 = threading.Thread(target=choose, args=("block",))
+        t1.start(); t2.start()
+        t1.join(10); t2.join(10)
+        self.assertFalse(t1.is_alive() or t2.is_alive())
+        self.assertEqual(sorted(results.values()), [200, 409])
+        self.assertEqual(
+            self.host_status()["reports"][0]["status"] in {"kept", "blocked"},
+            True,
+        )
+
+    def test_blocked_state_persists_across_restart(self):
+        resp = report_review(self.client, self.tokens[0], "重启保留测试")
+        report_id = resp.get_json()["id"]
+        self.assertEqual(
+            decide_report(self.client, self.host_token, report_id, "block").status_code,
+            200,
+        )
+        app_module.init_db()
+        s = state(self.client, self.tokens[0])
+        self.assertIsNone(s["received"])
+        self.assertTrue(s["received_blocked"])
+        self.assertEqual(s["report"]["status"], "blocked")
+        self.assertEqual(
+            self.host_status()["reports"][0]["id"], report_id
+        )
+
+
 class OldSchemaMigrationTest(unittest.TestCase):
-    """旧库启动时自动支持问答、换发与移除存储：补表/补列/回填凭据，旧数据保留。"""
+    """旧库启动时自动支持问答、换发、移除、回执与举报存储：补表/补列/回填凭据，旧数据保留。"""
 
     OLD_SCHEMA = """
     CREATE TABLE sessions (
@@ -1708,6 +1924,8 @@ class OldSchemaMigrationTest(unittest.TestCase):
                 c.close()
             self.assertIn("clarifications", tables)
             self.assertIn("token_history", tables)
+            self.assertIn("receipts", tables)
+            self.assertIn("reports", tables)
 
             # 旧数据原样保留，且新表可直接读写
             client = new_client()
@@ -1837,8 +2055,22 @@ class OldSchemaMigrationTest(unittest.TestCase):
             finally:
                 c.close()
             self.assertIn("receipts", tables)
+            self.assertIn("reports", tables)
 
             client = new_client()
+            # 旧库既有意见初始为未举报，且可直接举报、处理、屏蔽
+            self.assertIsNone(client.get("/api/p/tk").get_json()["report"])
+            report_resp = report_review(client, "tk", "旧库举报")
+            self.assertEqual(report_resp.status_code, 200, report_resp.get_json())
+            report_id = report_resp.get_json()["id"]
+            self.assertEqual(
+                decide_report(client, "ht", report_id, "block").status_code, 200
+            )
+            blocked_state = client.get("/api/p/tk").get_json()
+            self.assertIsNone(blocked_state["received"])
+            self.assertTrue(blocked_state["received_blocked"])
+            self.assertEqual(blocked_state["report"]["status"], "blocked")
+
             # 既有意见初始为待确认
             data = client.get("/api/p/tk").get_json()
             self.assertEqual(
@@ -1849,8 +2081,11 @@ class OldSchemaMigrationTest(unittest.TestCase):
             self.assertEqual(resp.status_code, 200, resp.get_json())
             first_at = resp.get_json()["acknowledged_at"]
             self.assertTrue(first_at)
-            # 模拟重启：回执保留、首次时间不变；重复确认仍成功且不改首次时间
+            # 模拟重启：举报裁定与回执均保留、首次时间不变；重复确认仍成功且不改首次时间
             app_module.init_db()
+            self.assertEqual(
+                client.get("/api/p/tk").get_json()["report"]["status"], "blocked"
+            )
             self.assertEqual(
                 client.get("/api/p/tk").get_json()["receipt"],
                 {"acknowledged": True, "acknowledged_at": first_at},
